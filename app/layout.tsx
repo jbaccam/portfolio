@@ -31,6 +31,22 @@ export default function RootLayout({
 }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en" className={`${anton.variable} ${archivo.variable}`}>
+      <head>
+        {/* Kick off the first visuals before the bundle hydrates so the poster
+            and opening frame are already in flight when the canvas mounts. */}
+        <link
+          rel="preload"
+          as="image"
+          href="/poster.jpg"
+          fetchPriority="high"
+        />
+        <link
+          rel="preload"
+          as="image"
+          href="/frames/f_001.webp"
+          fetchPriority="high"
+        />
+      </head>
       <body>
         {children}
         <div className="vignette" aria-hidden />

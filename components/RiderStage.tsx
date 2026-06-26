@@ -42,15 +42,27 @@ export default function RiderStage() {
 
     let next = 0;
     let done = 0;
-    const POOL = 8;
+    // More inflight requests fill the pipe faster on fast connections; the
+    // browser still caps real concurrency per-host, so this is a safe ceiling.
+    const POOL = 12;
 
     const loadOne = (i: number) =>
       new Promise<void>((resolve) => {
         const img = new Image();
         img.decoding = "async";
-        img.onload = img.onerror = () => resolve();
-        img.src = framePath(i + 1);
+        // Get the opening frames on the wire first so the gate lifts sooner.
+        if (i < REVEAL_AT) img.setAttribute("fetchpriority", "high");
         imgs[i] = img;
+        const finish = () => resolve();
+        img.onload = () => {
+          // Decode NOW, off the main thread, so the very first drawImage of
+          // each frame never triggers a synchronous decode mid-glide — the
+          // single biggest source of dropped frames in a canvas scrubber.
+          if (typeof img.decode === "function") img.decode().then(finish, finish);
+          else finish();
+        };
+        img.onerror = finish;
+        img.src = framePath(i + 1);
       });
 
     const worker = async () => {
@@ -93,7 +105,13 @@ export default function RiderStage() {
       html.style.overscrollBehavior = "none";
 
       const cv = canvas.current!;
-      const ctx = cv.getContext("2d", { alpha: true })!;
+      // alpha:false — frames are cover-fit so they always fill the canvas
+      // opaquely; dropping the alpha channel lets the compositor skip blending.
+      // desynchronized — opt into the low-latency present path, fewer stalls.
+      const ctx = cv.getContext("2d", {
+        alpha: false,
+        desynchronized: true,
+      })!;
       const proxy = { p: HOLDS[0] };
       let activeIdx = 0;
       let animating = false;
@@ -147,8 +165,30 @@ export default function RiderStage() {
         return -1;
       };
 
-      // paint with cover-fit (we manage scaling, so no CSS object-fit needed)
+      // Cover-fit geometry is identical for every frame (they share one size)
+      // and only changes on resize — compute it once and reuse, so the hot
+      // paint path is just a clamp + lookup + drawImage.
       let drawn = -1;
+      const dest = { dx: 0, dy: 0, dw: 0, dh: 0 };
+      const computeDest = (img: HTMLImageElement) => {
+        const cw = cv.width;
+        const ch = cv.height;
+        const ir = img.naturalWidth / img.naturalHeight;
+        if (cw / ch > ir) {
+          dest.dw = cw;
+          dest.dh = cw / ir;
+          dest.dx = 0;
+          dest.dy = (ch - dest.dh) / 2;
+        } else {
+          dest.dh = ch;
+          dest.dw = ch * ir;
+          dest.dx = (cw - dest.dw) / 2;
+          dest.dy = 0;
+        }
+      };
+
+      // paint with cover-fit (we manage scaling, so no CSS object-fit needed)
+      let geomReady = false;
       const paint = (p: number) => {
         const idx = Math.max(
           0,
@@ -157,42 +197,57 @@ export default function RiderStage() {
         const use = nearestLoaded(idx);
         if (use < 0 || use === drawn) return;
         const img = frames.current[use];
-        const cw = cv.width;
-        const ch = cv.height;
-        const ir = img.naturalWidth / img.naturalHeight;
-        let dw, dh, dx, dy;
-        if (cw / ch > ir) {
-          dw = cw;
-          dh = cw / ir;
-          dx = 0;
-          dy = (ch - dh) / 2;
-        } else {
-          dh = ch;
-          dw = ch * ir;
-          dx = (cw - dw) / 2;
-          dy = 0;
+        if (!geomReady) {
+          computeDest(img);
+          geomReady = true;
         }
-        ctx.drawImage(img, dx, dy, dw, dh);
+        ctx.drawImage(img, dest.dx, dest.dy, dest.dw, dest.dh);
         drawn = use;
       };
 
-      const resize = () => {
+      const applyResize = () => {
         const dpr = Math.min(2, window.devicePixelRatio || 1);
         cv.width = Math.round(window.innerWidth * dpr);
         cv.height = Math.round(window.innerHeight * dpr);
         drawn = -1;
+        geomReady = false; // canvas dimensions changed → recompute cover-fit
         paint(proxy.p);
       };
-      resize();
+      applyResize();
+
+      // Coalesce resize bursts into a single repaint on the next frame so a
+      // window drag doesn't reallocate the canvas backing store dozens of times.
+      let resizeRaf = 0;
+      const resize = () => {
+        if (resizeRaf) return;
+        resizeRaf = requestAnimationFrame(() => {
+          resizeRaf = 0;
+          applyResize();
+        });
+      };
       window.addEventListener("resize", resize);
 
+      // Writing a custom property on :root invalidates style for the whole
+      // document, so only write when the rounded value actually changes —
+      // otherwise we'd trigger a recalc on every one of ~84 glide frames for
+      // values that often haven't visibly moved.
       let lastP = proxy.p;
+      let lastSpeed = -1;
+      let lastFill = -1;
       const render = () => {
         const p = proxy.p;
         paint(p);
         tl.seek(p, false);
-        setVar("--speed", Math.min(1, Math.abs(p - lastP) * 120).toFixed(3));
-        setVar("--rail-fill", `${(p * 100).toFixed(2)}%`);
+        const speed = +Math.min(1, Math.abs(p - lastP) * 120).toFixed(3);
+        if (speed !== lastSpeed) {
+          setVar("--speed", String(speed));
+          lastSpeed = speed;
+        }
+        const fill = +(p * 100).toFixed(2);
+        if (fill !== lastFill) {
+          setVar("--rail-fill", `${fill}%`);
+          lastFill = fill;
+        }
         lastP = p;
       };
       render();
@@ -216,6 +271,7 @@ export default function RiderStage() {
           onComplete: () => {
             animating = false;
             setVar("--speed", "0");
+            lastSpeed = 0;
           },
         });
       };
@@ -299,6 +355,7 @@ export default function RiderStage() {
         tl.kill();
         cool?.kill();
         gsap.killTweensOf(proxy);
+        if (resizeRaf) cancelAnimationFrame(resizeRaf);
         window.removeEventListener("wheel", onWheel);
         window.removeEventListener("resize", resize);
         window.removeEventListener("keydown", onKey);
